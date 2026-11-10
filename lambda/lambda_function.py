@@ -337,14 +337,24 @@ def replace_words(query):
 # Replaces words and special characters to improve API response speech
 def improve_response(speech):
     global user_locale
-    speech = speech.replace(':\n\n', '').replace('\n\n', '. ').replace('\n', ',').replace('-', '').replace('_', ' ')
+    # Remove markdown the LLM may send, without touching ":", "-", "%" or "$" inside sentences
+    speech = re.sub(r'(?m)^[ \t]*#+[ \t]*', '', speech)                    # headings
+    speech = re.sub(r'(?m)^[ \t]*(?:[-*•+]|\d+[.)])[ \t]+', '', speech)    # list markers at line start
+    speech = speech.replace('**', '').replace('`', '').replace('*', '').replace('_', ' ')
+    # Line breaks become pauses
+    speech = re.sub(r':[ \t]*\n+', ': ', speech)
+    speech = re.sub(r'\n{2,}', '. ', speech)
+    speech = speech.replace('\n', ', ')
 
     # Change decimal separator if user_locale = "de-DE"
     if user_locale == "DE":
         # Only replace decimal separators and not 1.000 separators
         speech = re.sub(r'(\d+)\.(\d{1,3})(?!\d)', r'\1,\2', speech)  # Decimal point (e.g. 2.4 -> 2,4)
-    
-    speech = re.sub(r'[^A-Za-z0-9çÇáàâãäéèêíïóôõöúüñÁÀÂÃÄÉÈÊÍÏÓÔÕÖÚÜÑ\sß.,!?°]', '', speech)
+
+    # Allowlist keeps the text safe inside SSML (no "<", ">" or "&") and drops emojis
+    speech = re.sub(r'[^A-Za-z0-9çÇáàâãäéèêíïóôõöúüñÁÀÂÃÄÉÈÊÍÏÓÔÕÖÚÜÑ\sß.,;:!?°%$+\-/()\'"]', '', speech)
+    speech = re.sub(r'([.!?])[ \t]*[.,]', r'\1', speech)  # ". ." / "., " leftovers
+    speech = re.sub(r'[ \t]{2,}', ' ', speech).strip()
     return speech
 
 # Loads the initial APL screen template
