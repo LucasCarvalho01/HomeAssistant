@@ -20,6 +20,13 @@ from ask_sdk_core.dispatch_components import AbstractRequestHandler, AbstractExc
 from ask_sdk_model.interfaces.alexa.presentation.apl import RenderDocumentDirective, ExecuteCommandsDirective, OpenUrlCommand
 from datetime import datetime, timezone, timedelta
 
+logger = logging.getLogger(__name__)
+
+# Locale codes look like "pt-BR"; anything else falls back to en-US
+LOCALE_PATTERN = re.compile(r"^[a-z]{2}-[A-Z]{2}$")
+# Only input_text entities are accepted for the prompter feature
+INPUT_TEXT_PATTERN = re.compile(r"^input_text\.[a-z0-9_]+$")
+
 # Load configurations and localization
 def load_config(file_name):
     if str(file_name).endswith(".lang") and not os.path.exists(file_name):
@@ -31,8 +38,8 @@ def load_config(file_name):
                 if not line or '=' not in line:
                     continue
                 name, value = line.split('=', 1)
-                # Store in global vars
-                globals()[name] = value
+                # Store in global vars (tolerates spaces around "=")
+                globals()[name.strip()] = value.strip()
     except Exception as e:
         logger.error(f"Error loading file: {str(e)}")
 
@@ -41,8 +48,8 @@ load_config("config.cfg")
 load_config("locale/en-US.lang")
 
 # Log configuration
-debug = bool(globals().get("debug", False))
-logger = logging.getLogger(__name__)
+# bool("False") is True in Python, so compare the text explicitly
+debug = str(globals().get("debug", "False")).strip().lower() == "true"
 logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
 # Note: config.cfg stores values as strings; we'll normalize expected boolean
@@ -52,42 +59,86 @@ logger.setLevel(logging.DEBUG if debug else logging.INFO)
 if not globals().get("home_assistant_url") or not globals().get("home_assistant_token"):
     raise ValueError("home_assistant_url or home_assistant_token configuration are not set!")
 
-# Globals for conversation
-conversation_id = None
+# Globals (configuration only; per-conversation state lives in session attributes)
 last_interaction_date = None
-is_apl_supported = False
 user_locale = "US"  # Default locale
-home_assistant_url = globals().get("home_assistant_url", "").strip("/")
+home_assistant_url = globals().get("home_assistant_url", "").strip().rstrip("/")
+if not home_assistant_url.startswith("https://"):
+    raise ValueError("home_assistant_url must start with https://")
 apl_document_token = str(uuid.uuid4())
-assist_input_entity = globals().get("assist_input_entity", "input_text.assistant_input")
+# Prompter feature is opt-in: empty means disabled
+assist_input_entity = str(globals().get("assist_input_entity", "")).strip()
+if assist_input_entity and not INPUT_TEXT_PATTERN.match(assist_input_entity):
+    raise ValueError("assist_input_entity must look like input_text.some_name")
 home_assistant_room_recognition = str(globals().get("home_assistant_room_recognition", "False")).lower()
 home_assistant_kioskmode = str(globals().get("home_assistant_kioskmode", "False")).lower()
 ask_for_further_commands = str(globals().get("ask_for_further_commands", "False")).lower()
 suppress_greeting = str(globals().get("suppress_greeting", "False")).lower()
 
-# Helper: fetch text input via webhook
+# Builds the headers for every call to Home Assistant
+def ha_headers():
+    headers = {
+        "Authorization": "Bearer {}".format(globals().get("home_assistant_token")),
+        "Content-Type": "application/json",
+    }
+    # Optional Cloudflare Access Service Token (both values must be set)
+    cf_id = str(globals().get("cf_access_client_id", "")).strip()
+    cf_secret = str(globals().get("cf_access_client_secret", "")).strip()
+    if cf_id and cf_secret:
+        headers["CF-Access-Client-Id"] = cf_id
+        headers["CF-Access-Client-Secret"] = cf_secret
+    return headers
+
+# Logs a failed HA call without dumping secrets or whole HTML pages
+def log_http_failure(context, response):
+    if 300 <= response.status_code < 400:
+        # Cloudflare Access answers 302 to its login page when the Service Token is missing or wrong
+        logger.error(f"{context}: HTTP {response.status_code} redirect (check the Cloudflare Access Service Token/policy)")
+    else:
+        logger.error(f"{context}: HTTP {response.status_code} {response.text[:200]}")
+
+# Checks, per request, whether the current device has a screen (APL)
+def supports_apl(handler_input):
+    device = handler_input.request_envelope.context.system.device
+    return device.supported_interfaces.alexa_presentation_apl is not None
+
+# Helper: fetch a prompt that Home Assistant left in an input_text helper
 def fetch_prompt_from_ha():
     """
-    Reads the state of your input_text helper directly via REST API.
+    Reads the state of your input_text helper via REST API and clears it,
+    so the same prompt never runs twice. Disabled when assist_input_entity is empty.
     """
+    if not assist_input_entity:
+        return ""
     try:
         url = f"{home_assistant_url}/api/states/{assist_input_entity}"
-        headers = {
-            "Authorization": "Bearer {}".format(globals().get("home_assistant_token")),
-            "Content-Type": "application/json",
-        }
-        resp = requests.get(url, headers=headers, timeout=5)
-        if resp.status_code == 200:
-            return resp.json().get("state", "").strip()
-        else:
-            logger.error(f"HA state fetch failed: {resp.status_code} {resp.text}")
+        resp = requests.get(url, headers=ha_headers(), timeout=5, allow_redirects=False)
+        if resp.status_code != 200:
+            log_http_failure("HA state fetch failed", resp)
+            return ""
+        prompt = resp.json().get("state", "").strip()
+        if prompt and prompt.lower() not in ("none", "unknown", "unavailable"):
+            # Consume the prompt: reset the helper to "none"
+            clear_url = f"{home_assistant_url}/api/services/input_text/set_value"
+            clear = requests.post(
+                clear_url,
+                headers=ha_headers(),
+                json={"entity_id": assist_input_entity, "value": "none"},
+                timeout=3,
+                allow_redirects=False,
+            )
+            if clear.status_code != 200:
+                log_http_failure("HA prompt clear failed", clear)
+            return prompt
     except Exception as e:
-        logger.error(f"Error fetching prompt from HA state: {e}")
+        logger.error(f"Error fetching prompt from HA state: {type(e).__name__}")
     return ""
 
 def localize(handler_input):
     # Load locale per user
-    locale = handler_input.request_envelope.request.locale
+    locale = handler_input.request_envelope.request.locale or "en-US"
+    if not LOCALE_PATTERN.match(locale):
+        locale = "en-US"
     load_config(f"locale/{locale}.lang")
 
     # save user_locale var for regional differences in number handling like 2.4°C / 2,4°C
@@ -99,25 +150,19 @@ class LaunchRequestHandler(AbstractRequestHandler):
         return ask_utils.is_request_type("LaunchRequest")(handler_input)
 
     def handle(self, handler_input):
-        global conversation_id, last_interaction_date, is_apl_supported
-        
+        global last_interaction_date
+
         localize(handler_input)
 
-        # Check for a pre-set prompt from HA
+        # Check for a pre-set prompt from HA (only if the prompter feature is configured)
         prompt = fetch_prompt_from_ha()
-        # Only treat valid prompts that are not the literal "none"
-        if prompt and prompt.lower() != "none":
+        if prompt:
             # Process this prompt as user input and keep session open for follow-up
-            response = process_conversation(prompt)
+            response = process_conversation(prompt, handler_input)
             return handler_input.response_builder.speak(response).ask(globals().get("alexa_speak_question")).response
 
-        # No prompt and Checks if the device has a screen (APL support), if so, loads the interface
-        device = handler_input.request_envelope.context.system.device
-        is_apl_supported = device.supported_interfaces.alexa_presentation_apl is not None
-        logger.debug("Device: " + repr(device))
-        
-        # Renders the APL document with the button to open HA (if the device has a screen)
-        if is_apl_supported:
+        # No prompt: if the device has a screen (APL support), loads the interface
+        if supports_apl(handler_input):
             handler_input.response_builder.add_directive(
                 RenderDocumentDirective(token=apl_document_token, document=load_template("apl_openha.json"))
             )
@@ -150,8 +195,10 @@ class GptQueryIntentHandler(AbstractRequestHandler):
         response_builder = handler_input.response_builder
 
         # Extract user query
-        query = request.intent.slots["query"].value
-        logger.info(f"Query received from Alexa: {query}")
+        query = (request.intent.slots["query"].value or "").strip()
+        logger.debug(f"Query received from Alexa: {query}")
+        if not query:
+            return response_builder.speak(globals().get("alexa_speak_help")).ask(globals().get("alexa_speak_help")).response
 
         # Handle keyword-based logic
         keyword_response = keywords_exec(query, handler_input)
@@ -161,11 +208,13 @@ class GptQueryIntentHandler(AbstractRequestHandler):
         # Include device ID if needed
         device_id = ""
         if home_assistant_room_recognition == "true":
+            # Drop any spoken "device_id:" so only the real one reaches the LLM
+            query = re.sub(r"device[_ ]?id\s*:?", "", query, flags=re.IGNORECASE).strip()
             device_id = f". device_id: {context.system.device.device_id}"
 
         full_query = query + device_id
-        response = process_conversation(full_query)
-        logger.info(f"Response generated: {response}")
+        response = process_conversation(full_query, handler_input)
+        logger.debug(f"Response generated: {response}")
 
         logger.debug(f"Ask for further commands enabled: {ask_for_further_commands}")
         if ask_for_further_commands == "true":
@@ -197,22 +246,22 @@ def keywords_exec(query, handler_input):
 
 
 # Calls the Home Assistant API and handles the response
-def process_conversation(query):
-    global conversation_id
-    
+def process_conversation(query, handler_input):
+    # Conversation memory lives in the Alexa session: a one-shot request
+    # ("pergunte ao ... X") starts a fresh conversation, an open session keeps it
+    session_attr = handler_input.attributes_manager.session_attributes
+    conversation_id = session_attr.get("conversation_id")
+
     # Gets user-configured environment variables
     if not home_assistant_url:
         logger.error("Please set 'home_assistant_url' in the config.cfg file.")
         return globals().get("alexa_speak_error")
-    
+
     home_assistant_agent_id = globals().get("home_assistant_agent_id", None)
     home_assistant_language = globals().get("home_assistant_language", None)
-        
+
     try:
-        headers = {
-            "Authorization": "Bearer {}".format(globals().get("home_assistant_token")),
-            "Content-Type": "application/json",
-        }
+        headers = ha_headers()
         data = {
             "text": replace_words(query)
         }
@@ -225,23 +274,28 @@ def process_conversation(query):
             data["conversation_id"] = conversation_id
 
         ha_api_url = "{}/api/conversation/process".format(home_assistant_url)
-        logger.debug(f"HA request url: {ha_api_url}")        
+        logger.debug(f"HA request url: {ha_api_url}")
         logger.debug(f"HA request data: {data}")
-        
-        response = requests.post(ha_api_url, headers=headers, json=data, timeout=7)
-        
+
+        # No redirects: a redirect here means Cloudflare Access rejected the request
+        response = requests.post(ha_api_url, headers=headers, json=data, timeout=7, allow_redirects=False)
+
         logger.debug(f"HA response status: {response.status_code}")
         logger.debug(f"HA response data: {response.text}")
-        
+
         contenttype = response.headers.get('Content-Type', '')
         logger.debug(f"Content-Type: {contenttype}")
-        
-        if (contenttype == "application/json"):
+
+        if response.status_code >= 300 and not contenttype.startswith("application/json"):
+            log_http_failure("HA conversation call failed", response)
+            return globals().get("alexa_speak_error")
+
+        if contenttype.startswith("application/json"):
             response_data = response.json()
             speech = None
 
             if response.status_code == 200 and "response" in response_data:
-                conversation_id = response_data.get("conversation_id", conversation_id)
+                session_attr["conversation_id"] = response_data.get("conversation_id", conversation_id)
                 response_type = response_data["response"]["response_type"]
                 
                 if response_type == "action_done" or response_type == "query_answer":
@@ -255,38 +309,24 @@ def process_conversation(query):
                     speech = globals().get("alexa_speak_error")
 
             if not speech:
+                # Log HA's message, but never speak internal error text out loud
                 if "message" in response_data:
-                    message = response_data["message"]
-                    logger.error(f"Empty speech: {message}")
-                    return improve_response(f"{globals().get('alexa_speak_error')} {message}")
+                    logger.error(f"Empty speech (HTTP {response.status_code}): {response_data['message']}")
                 else:
-                    logger.error(f"Empty speech: {response_data}")
-                    return globals().get("alexa_speak_error")
+                    logger.error(f"Empty speech (HTTP {response.status_code})")
+                return globals().get("alexa_speak_error")
 
             return improve_response(speech)
-        elif (contenttype == "text/html") and int(response.status_code, 0) >= 400:
-            errorMatch = re.search(r'<title>(.*?)</title>', response.text, re.IGNORECASE)
-            
-            if errorMatch:
-                title = errorMatch.group(1)
-                logger.error(f"HTTP error {response.status_code} ({title}): Unable to connect to your Home Assistant server")
-            else:
-                logger.error(f"HTTP error {response.status_code}: Unable to connect to your Home Assistant server. \n {response.text}")
-                
-            return globals().get("alexa_speak_error")
-        elif  (contenttype == "text/plain") and int(response.status_code, 0) >= 400:
-            logger.error(f"Error processing request: {response.text}")
-            return globals().get("alexa_speak_error")
         else:
-            logger.error(f"Error processing request: {response.text}")
+            log_http_failure("Unexpected HA response", response)
             return globals().get("alexa_speak_error")
-            
-    except requests.exceptions.Timeout as te:
-        logger.error(f"Timeout when communicating with Home Assistant: {str(te)}", exc_info=True)
+
+    except requests.exceptions.Timeout:
+        logger.error("Timeout when communicating with Home Assistant")
         return globals().get("alexa_speak_timeout")
 
     except Exception as e:
-        logger.error(f"Error processing response: {str(e)}", exc_info=True)
+        logger.error(f"Error processing response: {type(e).__name__}", exc_info=debug)
         return globals().get("alexa_speak_error")
 
 # Replaces incorrectly generated words by Alexa interpreter in the query
@@ -323,7 +363,7 @@ def load_template(filepath):
 
 # Opens Home Assistant dashboard in Silk browser
 def open_page(handler_input):
-    if is_apl_supported:
+    if supports_apl(handler_input):
         # Renders an empty template, required for the OpenURL command
         # https://amazon.developer.forums.answerhub.com/questions/220506/alexa-open-a-browser.html
         
@@ -395,11 +435,15 @@ class CatchAllExceptionHandler(AbstractExceptionHandler):
         return True
 
     def handle(self, handler_input, exception):
-        logger.error(exception, exc_info=True)
+        logger.error(f"Unhandled exception: {type(exception).__name__}", exc_info=debug)
         speak_output = globals().get("alexa_speak_error")
         return handler_input.response_builder.speak(speak_output).ask(speak_output).response
 
 sb = SkillBuilder()
+# Optional: only accept requests from this skill (set alexa_skill_id in config.cfg)
+alexa_skill_id = str(globals().get("alexa_skill_id", "")).strip()
+if alexa_skill_id:
+    sb.skill_id = alexa_skill_id
 sb.add_request_handler(LaunchRequestHandler())
 sb.add_request_handler(GptQueryIntentHandler())
 sb.add_request_handler(HelpIntentHandler())

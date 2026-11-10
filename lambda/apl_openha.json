@@ -9,7 +9,7 @@
         "items": [
           {
             "type": "Image",
-            "source": "https://raw.githubusercontent.com/fabianosan/HomeAssistantAssist/refs/heads/main/skill-package/assets/images/common_background.jpg",
+            "source": "https://raw.githubusercontent.com/LucasCarvalho01/HomeAssistant/refs/heads/main/skill-package/assets/images/common_background.jpg",
             "scale": "fill",
             "width": "100vw",
             "height": "100vh",
@@ -18,7 +18,7 @@
           },
           {
             "type": "Image",
-            "source": "https://raw.githubusercontent.com/fabianosan/HomeAssistantAssist/refs/heads/main/skill-package/assets/images/common_ha_title.png",
+            "source": "https://raw.githubusercontent.com/LucasCarvalho01/HomeAssistant/refs/heads/main/skill-package/assets/images/common_ha_title.png",
             "scale": "best-fit",
             "width": "70vw",
             "height": "100dp",
@@ -28,7 +28,7 @@
           },
           {
             "type": "Text",
-            "text": "Bem-vindo à casa Vitucci!",
+            "text": "Bem-vindo!",
             "fontSize": "50dp",
             "textAlign": "center",
             "backgroundColor": "#4CAF50",

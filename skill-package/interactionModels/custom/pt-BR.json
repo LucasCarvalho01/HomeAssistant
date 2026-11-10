@@ -1,7 +1,7 @@
 {
   "interactionModel": {
       "languageModel": {
-          "invocationName": "casa inteligente",
+          "invocationName": "jorge",
           "intents": [
               {
                   "name": "AMAZON.CancelIntent",
